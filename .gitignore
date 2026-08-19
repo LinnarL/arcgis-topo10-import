@@ -1,0 +1,19 @@
+# Lantmäteriet-leveransen (data + symbolfiler) — laddas ned från Geotorget
+Example Topo 10 Download/
+
+# Uppackade GeoPackage och nedladdade ZIP
+LM_Topo10_uppackat/
+_uppackat/
+*.gpkg
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+
+# ArcGIS
+*.lock
+*.aprx.bak
+
+# Esri-genererade metadatastubbar
+*.pyt.xml
