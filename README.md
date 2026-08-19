@@ -84,13 +84,6 @@ Symbologi tillämpad på 7 lager; 30 lager utan data togs bort.
 5. **Map** — Lantmäteriet's `.lyrx` group layer is inserted and each layer repointed to the new
    feature classes; layers with no imported data are removed.
 
-### Repointing the symbology
-
-The layers in Lantmäteriet's `.lyrx` are **query layers** (`CIMSqlQueryDataConnection`) against the
-GeoPackages. `updateConnectionProperties` fails silently on those — the layer stays broken. The tool
-replaces the whole `dataConnection` with a `CIMStandardDataConnection` through the CIM instead, which
-keeps renderers, labels, scale ranges and definition queries. That matters: several tables carry more
-than one layer, split by definition query (`Väglinje (bro och tunnel)`, `Rälstrafik under mark`, …).
 
 ## Performance
 
@@ -102,7 +95,6 @@ Measured on an 11 × 9 km area, including unzipping, on a laptop with the delive
 | kommunikation + text | 2.1 GB GPKG, `vaglinje` 3 024 958 → 24 000 features | 19 s |
 | mark + höjd | 12.5 GB + 8.5 GB extracted | 102 s |
 
-Extraction dominates the first run of a theme; later runs reuse the cache and take seconds.
 
 ## Notes
 
