@@ -3,8 +3,12 @@
 ImportTopo10.pyt
 
 Importerar Lantmäteriet Topografi 10 (vektor) från en nedladdad leverans till en
-filgeodatabas, klippt mot den omslutande rektangeln (bounding box) för valda
-lager i kartan.
+filgeodatabas, klippt mot en rektangel (bounding box). Rektangeln är antingen
+den omslutande rektangeln för polygoner (ur ett lager, med markering, eller
+ritade i kartan) eller en utbredning (kartvyn, ett lagers utbredning, en ritad
+rektangel eller koordinater), plus en valfri marginal. Klippningen sker alltid
+mot hela rektangeln, inte mot polygonernas form: en topografisk bakgrundskarta
+ska täcka en hel rektangel.
 
 Leveransen från Lantmäteriet består av en ZIP per tema, där varje ZIP innehåller
 ett rikstäckande GeoPackage i SWEREF99 TM (EPSG:3006), t.ex.:
@@ -20,6 +24,9 @@ till i kartan och pekas om till de importerade featureklasserna. Teckensnittet
 lmtopografisymboler.ttf måste vara installerat i Windows för att symbolerna ska
 visas korrekt.
 
+Verktygstips (parameterförklaringar) skrivs till ImportTopo10.ImportTopo10.pyt.xml
+från TOOLTIPS nedan när verktygslådan laddas, så att texten bara finns på ett ställe.
+
 Krav: ArcGIS Pro 3.x (arcpy). Ingen extra licensnivå — PairwiseClip ingår i Basic.
 """
 
@@ -27,13 +34,116 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import uuid
 import zipfile
+from xml.sax.saxutils import escape
 
 import arcpy
 
 # ── Konstanter ────────────────────────────────────────────────────────────────
 
 SWEREF99TM_WKID = 3006
+
+AOI_POLYGONS = "Polygoner (lager eller ritade i kartan)"
+AOI_EXTENT = "Utbredning (kartvy, lager eller koordinater)"
+# Tidigare etikett, accepteras från skript men visas inte i listan.
+AOI_POLYGONS_OLD = "Polygoner i ett lager"
+
+TOOL_SUMMARY = (
+    "Importerar Lantmäteriet Topografi 10 (vektor) från en nedladdad leverans till en "
+    "filgeodatabas, klippt mot en rektangel runt området. Området anges med polygoner "
+    "(ur ett lager eller ritade i kartan) eller med en utbredning (kartvyn, ett lagers "
+    "utbredning, en ritad rektangel eller koordinater). Data levereras som rikstäckande "
+    "GeoPackage i SWEREF99 TM; varje valt tema packas upp en gång till en cache-mapp och "
+    "återanvänds. Lantmäteriets symbologi kan läggas till i kartan och pekas om till de "
+    "importerade featureklasserna."
+)
+
+# Verktygstips per parameter, visas i verktygsdialogen. Se _write_tool_metadata.
+TOOLTIPS = {
+    "aoi_mode": (
+        "Hur området avgränsas. Resultatet klipps alltid mot en hel rektangel, aldrig mot "
+        "polygonernas form, eftersom en topografisk bakgrundskarta ska täcka hela "
+        "rektangeln.\n"
+        "'Polygoner' använder den omslutande rektangeln för polygoner i ett lager eller "
+        "polygoner du ritar i kartan. 'Utbredning' använder en rektangel direkt: kartvyns "
+        "aktuella utbredning, ett lagers utbredning, en ritad rektangel eller inskrivna "
+        "koordinater."
+    ),
+    "aoi": (
+        "Polygoner som definierar området. Välj ett polygonlager i listan, eller använd "
+        "ritverktyget och rita en eller flera polygoner i kartan. Har lagret en markering "
+        "används bara de markerade objekten. Lagret kan ha vilket koordinatsystem som helst "
+        "men måste ha ett. Data klipps mot polygonernas gemensamma omslutande rektangel "
+        "(bounding box) plus marginalen, inte mot själva polygonerna."
+    ),
+    "aoi_extent": (
+        "Rektangel som avgränsar området. I listan kan du välja kartvyns aktuella "
+        "utbredning, eller ett lager för att använda hela lagrets utbredning. Du kan också "
+        "rita en rektangel i kartan eller skriva in koordinater. Resultatet täcker hela "
+        "rektangeln plus marginalen. "
+        "Inskrivna koordinater tolkas i den aktiva kartans koordinatsystem, utan aktiv karta "
+        "i SWEREF99 TM; vilket som användes står i meddelandena."
+    ),
+    "buffer_m": (
+        "Marginal i meter som läggs till på alla fyra sidor av rektangeln, i SWEREF99 TM. "
+        "0 = ingen marginal. Kan inte vara negativ."
+    ),
+    "source_folder": (
+        "Mappen med Lantmäteriets nedladdade Topo 10-leverans: en ZIP per tema, och/eller "
+        "redan uppackade GeoPackage. Mappen genomsöks 3 nivåer ned. Fylls i automatiskt om "
+        "en sådan mapp ligger bredvid verktygslådan. Leveransen ändras aldrig."
+    ),
+    "themes": (
+        "Vilka teman som importeras, t.ex. mark_sverige eller hydro_sverige. Listan byggs "
+        "från källmappen. Tomt = alla teman. Stora teman (mark, höjd) är flera GB och "
+        "packas upp till cache-mappen första gången, vilket kan ta några minuter."
+    ),
+    "out_gdb": (
+        "Filgeodatabas som featureklasserna skrivs till, som standard projektets "
+        "standardgeodatabas. Utdata är alltid i SWEREF99 TM, oavsett kartans "
+        "koordinatsystem."
+    ),
+    "prefix": (
+        "Text som sätts före varje featureklass namn, t.ex. 'topo_' ger topo_mark. Tomt = "
+        "källtabellernas namn (mark, vaglinje, ...). Användbart för att hålla flera områden "
+        "i samma geodatabas."
+    ),
+    "overwrite": (
+        "Skriv över featureklasser med samma namn som redan finns i geodatabasen. Avbockad: "
+        "befintliga featureklasser lämnas orörda och rapporteras som överhoppade."
+    ),
+    "skip_empty": (
+        "Skapa ingen featureklass för tabeller som saknar objekt inom rektangeln. Tabeller "
+        "vars utbredning inte når området hoppas då över utan att läsas, vilket går "
+        "snabbare. Avbockad: varje tabell i valda teman får en featureklass, även tomma."
+    ),
+    "cache_folder": (
+        "Mapp där ZIP-filerna packas upp till GeoPackage. Ett tema kan vara över 12 GB "
+        "uppackat, så välj en lokal disk med plats, inte en mapp som synkas till molnet "
+        "(OneDrive, SharePoint, Dropbox). Uppackade filer återanvänds vid nästa körning."
+    ),
+    "keep_extracted": (
+        "Behåll de GeoPackage som packades upp under körningen, så att nästa import går "
+        "snabbt. Avbockad: filer som packades upp nu tas bort efteråt (tidigare uppackade "
+        "filer lämnas kvar)."
+    ),
+    "add_to_map": (
+        "Lägg till de importerade featureklasserna i den aktiva kartan. Kräver ett öppet "
+        "projekt med en karta."
+    ),
+    "apply_symbology": (
+        "Lägg till Lantmäteriets lagerfil och peka om dess lager till de importerade "
+        "featureklasserna. Lager utan data tas bort. Symbolerna visas bara rätt om "
+        "teckensnittet lmtopografisymboler.ttf från leveransens mapp Symbolfiler är "
+        "installerat i Windows."
+    ),
+    "lyrx_file": (
+        "Lantmäteriets lagerfil (.lyrx) med symbologi. Fylls i automatiskt från mappen "
+        "Symbolfiler i källmappen. Tomt = verktyget letar själv i källmappen; hittas ingen "
+        "läggs lagren till utan symbologi."
+    ),
+}
 
 # Varning om den omslutande rektangeln blir orimligt stor (troligen ett
 # rikstäckande lager som råkat komma med).
@@ -249,168 +359,171 @@ def _bbox_overlaps(a, b):
 
 
 # =============================================================================
-# Omslutande rektangel från kartans lager
+# Område: polygoner eller utbredning -> rektangel i SWEREF99 TM
 # =============================================================================
 
-def _selection_count(lyr):
+def _polygon_schema():
     """
-    Antal markerade objekt i ett lager, 0 om inget är markerat.
+    Tom polygonfeatureklass i SWEREF99 TM som standardvärde för polygon-
+    parametern, så att dialogens ritverktyg ritar polygoner. Unikt namn i
+    stället för Exists/Delete: memory-arbetsytan delas av hela Pro-sessionen.
+    """
+    name = "aoi_schema_{}".format(uuid.uuid4().hex[:12])
+    arcpy.management.CreateFeatureclass("memory", name, "POLYGON",
+                                        spatial_reference=_sr())
+    return "memory/" + name
 
-    getSelectionSet() frågas först: Describe().FIDSet kan vara tom trots att
-    lagret har en markering.
+
+def _is_map_layer(value):
+    """Är parametervärdet ett kartlager (inte ritade objekt eller en sökväg)?"""
+    return hasattr(value, "isFeatureLayer") or type(value).__name__ == "Layer"
+
+
+def _has_any_feature(value):
+    """Minst ett objekt? Läser bara första raden."""
+    with arcpy.da.SearchCursor(value, ["OID@"]) as cur:
+        for _row in cur:
+            return True
+    return False
+
+
+def _aoi_box_from_polygons(value, messages):
+    """
+    (xmin, ymin, xmax, ymax) i SWEREF99 TM för polygonerna i parametervärdet.
+
+    Värdet är ett kartlager (markering respekteras av cursorn), ritade objekt
+    (record set) eller en sökväg. SearchCursor och Describe fungerar på alla tre.
     """
     try:
-        selected = lyr.getSelectionSet()
+        sr_in = arcpy.Describe(value).spatialReference
     except Exception:
-        selected = None
-    if selected:
-        return len(selected)
-    try:
-        fid_set = arcpy.Describe(lyr).FIDSet
-    except Exception:
-        fid_set = None
-    if fid_set:
-        return len([f for f in fid_set.split(";") if f.strip()])
-    return 0
-
-
-def _extent_from_features(lyr):
-    """Utbredning beräknad ur lagrets objekt (markering respekteras av cursorn)."""
-    ext = None
-    with arcpy.da.SearchCursor(lyr, ["SHAPE@"]) as cur:
-        for (geom,) in cur:
-            if geom is None:
-                continue
-            e = geom.extent
-            if ext is None:
-                ext = arcpy.Extent(e.XMin, e.YMin, e.XMax, e.YMax,
-                                   spatial_reference=e.spatialReference)
-            else:
-                ext = arcpy.Extent(min(ext.XMin, e.XMin), min(ext.YMin, e.YMin),
-                                   max(ext.XMax, e.XMax), max(ext.YMax, e.YMax),
-                                   spatial_reference=ext.spatialReference)
-    return ext
-
-
-def _layer_extent(lyr, use_selection):
-    """
-    (utbredning, antal markerade objekt) för ett lager. Utbredningen är None om
-    den inte går att bestämma. Om lagret har en markering och use_selection är
-    True beräknas utbredningen enbart ur de markerade objekten.
-    """
-    selected = _selection_count(lyr) if use_selection else 0
-    if selected:
-        ext = _extent_from_features(lyr)
-        if ext is not None:
-            return ext, selected
-
-    ext = None
-    try:
-        ext = arcpy.Describe(lyr).extent
-    except Exception:
-        ext = None
-    if ext is None or ext.XMin is None:
-        try:
-            ext = lyr.getExtent()
-        except Exception:
-            ext = None
-    if ext is None or ext.XMin is None:
-        return None, 0
-    return ext, 0
-
-
-def _extent_to_sweref(ext, messages, label=""):
-    """Projicera en utbredning till SWEREF99 TM."""
-    sr = ext.spatialReference
-    if sr is None or sr.name in ("", "Unknown"):
-        messages.addWarningMessage(
-            "  Lagret {} saknar koordinatsystem — antar SWEREF99 TM.".format(label)
-        )
-        return ext
-    if sr.factoryCode == SWEREF99TM_WKID:
-        return ext
-
-    poly = ext.polygon
-    span = max(ext.width, ext.height)
-    if span > 0:
-        try:
-            poly = poly.densify("DISTANCE", span / 50.0)
-        except Exception:
-            pass
-    return poly.projectAs(_sr()).extent
-
-
-def _resolve_layers(map_obj, layer_names):
-    """
-    Matcha parameterns lagernamn mot kartans lager. Namn som inte hittas
-    returneras oförändrade (kan vara en sökväg till en featureklass).
-    """
-    resolved = []
-    for name in layer_names:
-        hits = [h for h in map_obj.listLayers(name) if not h.isGroupLayer] if map_obj else []
-        if hits:
-            resolved.extend(hits)
-        else:
-            resolved.append(name)
-    return resolved
-
-
-def _map_layers(map_obj):
-    """Alla lager i kartan som kan bidra med en utbredning (utan bakgrundskartor)."""
-    out = []
-    for lyr in map_obj.listLayers():
-        try:
-            if lyr.isGroupLayer or lyr.isBasemapLayer or lyr.isBroken:
-                continue
-            if not (lyr.isFeatureLayer or lyr.isRasterLayer):
-                continue
-        except Exception:
-            continue
-        out.append(lyr)
-    return out
-
-
-def _bounding_box(layers, use_selection, buffer_m, messages):
-    """Gemensam omslutande rektangel i SWEREF99 TM."""
-    xmin = ymin = xmax = ymax = None
-    used = 0
-
-    for lyr in layers:
-        label = getattr(lyr, "name", str(lyr))
-        if isinstance(lyr, str) and not arcpy.Exists(lyr):
-            messages.addWarningMessage(
-                "  Hoppar över '{}' — lagret finns inte i kartan.".format(label)
-            )
-            continue
-        ext, selected = _layer_extent(lyr, use_selection)
-        if ext is None:
-            messages.addWarningMessage("  Hoppar över '{}' — ingen utbredning.".format(label))
-            continue
-        if ext.width == 0 and ext.height == 0 and ext.XMin == 0 and ext.YMin == 0:
-            messages.addWarningMessage("  Hoppar över '{}' — tomt lager.".format(label))
-            continue
-
-        ext = _extent_to_sweref(ext, messages, label)
-        if xmin is None:
-            xmin, ymin, xmax, ymax = ext.XMin, ext.YMin, ext.XMax, ext.YMax
-        else:
-            xmin, ymin = min(xmin, ext.XMin), min(ymin, ext.YMin)
-            xmax, ymax = max(xmax, ext.XMax), max(ymax, ext.YMax)
-        used += 1
-        messages.addMessage(
-            "  {}{}: {:.0f}, {:.0f} — {:.0f}, {:.0f}".format(
-                label,
-                " ({} markerade objekt)".format(selected) if selected else "",
-                ext.XMin, ext.YMin, ext.XMax, ext.YMax,
-            )
-        )
-
-    if xmin is None:
+        sr_in = None
+    if sr_in is None or not (sr_in.factoryCode or sr_in.exportToString()) \
+            or sr_in.name in ("", "Unknown"):
         raise ValueError(
-            "Kunde inte bestämma något område. Välj minst ett lager med geometri "
-            "(bakgrundskartor och trasiga lager används inte)."
+            "Polygonerna saknar koordinatsystem. Ange ett koordinatsystem för lagret "
+            "(Definiera projektion) eller rita polygonerna i kartan."
         )
 
+    label = getattr(value, "name", None)
+    selected = 0
+    if label and _is_map_layer(value):
+        try:
+            selected = len(value.getSelectionSet() or ())
+        except Exception:
+            selected = 0
+
+    xmin = ymin = xmax = ymax = None
+    count = 0
+    with arcpy.da.SearchCursor(value, ["SHAPE@"], spatial_reference=_sr()) as cur:
+        for (shape,) in cur:
+            if shape is None or shape.area <= 0:
+                continue
+            e = shape.extent
+            if xmin is None:
+                xmin, ymin, xmax, ymax = e.XMin, e.YMin, e.XMax, e.YMax
+            else:
+                xmin, ymin = min(xmin, e.XMin), min(ymin, e.YMin)
+                xmax, ymax = max(xmax, e.XMax), max(ymax, e.YMax)
+            count += 1
+
+    if count == 0:
+        raise ValueError("Rita minst en polygon i kartan eller välj ett polygonlager.")
+
+    if label and _is_map_layer(value):
+        source = "lagret '{}'{}".format(
+            label, ", bara markerade objekt" if selected else "")
+    else:
+        source = "ritade eller angivna polygoner"
+    messages.addMessage(
+        "  {} polygon{} från {} ({}): {:.0f}, {:.0f} - {:.0f}, {:.0f}".format(
+            count, "" if count == 1 else "er", source, sr_in.name,
+            xmin, ymin, xmax, ymax)
+    )
+    return xmin, ymin, xmax, ymax
+
+
+def _active_map_sr():
+    try:
+        m = arcpy.mp.ArcGISProject("CURRENT").activeMap
+        if m is not None and m.spatialReference is not None:
+            return m.spatialReference, m.name
+    except Exception:
+        pass
+    return None, None
+
+
+def _aoi_box_from_extent(value, text, messages):
+    """
+    (xmin, ymin, xmax, ymax) i SWEREF99 TM för en GPExtent-parameter.
+
+    .value är ett geoprocessing-extentobjekt, inte arcpy.Extent. Hörnen är
+    vanliga tal. Koordinatsystemet följer bara med när utbredningen kommer från
+    ett lager eller en datakälla, och då bara som WKT2 i valueAsText efter de
+    fyra talen. Inskrivna koordinater har inget; de tolkas i den aktiva kartans
+    koordinatsystem, eftersom en utbredning vald i dialogen anges i kartans
+    koordinater. Utan aktiv karta antas SWEREF99 TM (Topo 10:s eget system).
+    """
+    xmin, ymin, xmax, ymax = (float(value.XMin), float(value.YMin),
+                              float(value.XMax), float(value.YMax))
+    if not (xmax > xmin and ymax > ymin):
+        raise ValueError("Utbredningen har ingen yta.")
+
+    sr = None
+    parts = (text or "").split(" ", 4)
+    if len(parts) == 5 and parts[4].strip():
+        sr = arcpy.SpatialReference()
+        try:
+            sr.loadFromString(parts[4].strip())
+        except Exception:
+            sr = None
+    if sr is not None and (sr.factoryCode or sr.exportToString()):
+        source = "utbredningens eget koordinatsystem"
+    else:
+        sr, map_name = _active_map_sr()
+        if sr is not None and (sr.factoryCode or sr.exportToString()):
+            source = "den aktiva kartans koordinatsystem ({})".format(map_name)
+        else:
+            sr = _sr()
+            source = "ingen aktiv karta, så SWEREF99 TM antas"
+    messages.addMessage("  Utbredningen tolkas i {}: {}.".format(sr.name, source))
+
+    if sr.factoryCode == SWEREF99TM_WKID:
+        return xmin, ymin, xmax, ymax
+
+    # Förtäta kanterna, så att en utbredning i grader eller ett annat system
+    # inte blir en för liten fyrhörning efter omprojicering.
+    n = 16
+    pts = ([(xmin + (xmax - xmin) * i / n, ymin) for i in range(n)]
+           + [(xmax, ymin + (ymax - ymin) * i / n) for i in range(n)]
+           + [(xmax - (xmax - xmin) * i / n, ymax) for i in range(n)]
+           + [(xmin, ymax - (ymax - ymin) * i / n) for i in range(n)])
+    poly = arcpy.Polygon(arcpy.Array([arcpy.Point(x, y) for x, y in pts]), sr)
+    poly = poly.projectAs(_sr())
+    if poly is None or poly.area <= 0:
+        raise ValueError("Utbredningen kunde inte omvandlas till SWEREF99 TM.")
+    e = poly.extent
+    return e.XMin, e.YMin, e.XMax, e.YMax
+
+
+def _aoi_box(mode, polygons, extent_value, extent_text, messages):
+    """Områdets omslutande rektangel i SWEREF99 TM, utan marginal."""
+    if mode == AOI_EXTENT:
+        if extent_value is None or not extent_text:
+            raise ValueError("Ange en utbredning.")
+        messages.addMessage("Område från utbredning:")
+        return _aoi_box_from_extent(extent_value, extent_text, messages)
+    if mode in (AOI_POLYGONS, AOI_POLYGONS_OLD):
+        if polygons is None:
+            raise ValueError("Rita minst en polygon i kartan eller välj ett polygonlager.")
+        messages.addMessage("Område från polygoner:")
+        return _aoi_box_from_polygons(polygons, messages)
+    raise ValueError("Okänt val för 'Avgränsa området med': {}".format(mode))
+
+
+def _bounding_box(box, buffer_m, messages):
+    """Lägg till marginalen och returnera rektangeln som arcpy.Extent i SWEREF99 TM."""
+    xmin, ymin, xmax, ymax = box
     if buffer_m:
         xmin -= buffer_m
         ymin -= buffer_m
@@ -418,15 +531,16 @@ def _bounding_box(layers, use_selection, buffer_m, messages):
         ymax += buffer_m
 
     messages.addMessage(
-        "Omslutande rektangel ({} lager): {:.0f}, {:.0f} — {:.0f}, {:.0f} "
+        "Omslutande rektangel{}: {:.0f}, {:.0f} - {:.0f}, {:.0f} "
         "({:.1f} x {:.1f} km, SWEREF99 TM)".format(
-            used, xmin, ymin, xmax, ymax, (xmax - xmin) / 1000.0, (ymax - ymin) / 1000.0
+            " med {:g} m marginal".format(buffer_m) if buffer_m else "",
+            xmin, ymin, xmax, ymax, (xmax - xmin) / 1000.0, (ymax - ymin) / 1000.0
         )
     )
     if max(xmax - xmin, ymax - ymin) > _MAX_SANE_SIDE_M:
         messages.addWarningMessage(
-            "Området är över {:.0f} km på en sida — kontrollera att inget "
-            "rikstäckande lager ingår. Importen kan ta mycket lång tid.".format(
+            "Området är över {:.0f} km på en sida. Kontrollera att utbredningen eller "
+            "polygonerna är de avsedda; importen kan ta mycket lång tid.".format(
                 _MAX_SANE_SIDE_M / 1000.0
             )
         )
@@ -655,6 +769,59 @@ def _default_source_folder():
     return None
 
 
+def _write_tool_metadata(tool_cls, toolbox_alias):
+    """
+    Skriv verktygets metadatafil med parameterförklaringar från TOOLTIPS.
+
+    Pro läser verktygstipsen i dialogen från <verktygslåda>.<verktyg>.pyt.xml
+    (elementet dialogReference per parameter). Det finns inget attribut på
+    arcpy.Parameter för detta. Filen skrivs bara om innehållet har ändrats.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    toolbox = os.path.splitext(os.path.basename(__file__))[0]
+    path = os.path.join(here, "{}.{}.pyt.xml".format(toolbox, tool_cls.__name__))
+
+    def html(text):
+        body = escape(text).replace("\n", "</SPAN></P><P><SPAN>")
+        return escape('<DIV STYLE="text-align:Left;"><P><SPAN>{}</SPAN></P></DIV>'.format(body))
+
+    tool = tool_cls()
+    params = []
+    for p in tool.getParameterInfo(for_metadata=True):
+        tip = TOOLTIPS.get(p.name)
+        if not tip:
+            continue
+        params.append(
+            '<param name="{n}" displayname="{d}" type="{t}" direction="{r}">'
+            "<dialogReference>{h}</dialogReference>"
+            "<pythonReference>{h}</pythonReference></param>".format(
+                n=p.name, d=escape(p.displayName, {'"': "&quot;"}),
+                t=p.parameterType, r=p.direction, h=html(tip))
+        )
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<metadata xml:lang="sv"><Esri><ArcGISFormat>1.0</ArcGISFormat></Esri>'
+        '<tool name="{name}" displayname="{label}" toolboxalias="{alias}" xmlns="">'
+        "<parameters>{params}</parameters><summary>{summary}</summary></tool>"
+        "<dataIdInfo><idCitation><resTitle>{label}</resTitle></idCitation>"
+        "<idAbs>{summary}</idAbs></dataIdInfo></metadata>\n"
+    ).format(name=tool_cls.__name__, label=escape(tool.label), alias=toolbox_alias,
+             params="".join(params), summary=html(TOOL_SUMMARY))
+
+    try:
+        with open(path, encoding="utf-8") as fh:
+            if fh.read() == xml:
+                return
+    except OSError:
+        pass
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(xml)
+    except OSError:
+        # Skrivskyddad plats: verktyget fungerar ändå, bara utan verktygstips.
+        pass
+
+
 # =============================================================================
 # Toolbox
 # =============================================================================
@@ -664,36 +831,47 @@ class Toolbox:
         self.label = "Lantmäteriet Topo 10"
         self.alias = "topo10"
         self.tools = [ImportTopo10]
+        _write_tool_metadata(ImportTopo10, self.alias)
 
 
 class ImportTopo10:
     def __init__(self):
         self.label = "Importera Topo 10 till projektområdet"
-        self.description = (
-            "Importerar Lantmäteriet Topografi 10 (vektor) från en nedladdad leverans "
-            "till en filgeodatabas, klippt mot den omslutande rektangeln för valda lager "
-            "i kartan. Data levereras som rikstäckande GeoPackage i SWEREF99 TM; varje "
-            "valt tema packas upp en gång till en cache-mapp och återanvänds. "
-            "Lantmäteriets symbologi kan läggas till i kartan och pekas om till de "
-            "importerade featureklasserna."
-        )
+        self.description = TOOL_SUMMARY
         self.canRunInBackground = False
 
     # ── Parametrar ────────────────────────────────────────────────────────────
 
-    def getParameterInfo(self):
-        p_layers = arcpy.Parameter(
-            displayName="Lager som definierar området (tomt = alla lager i kartan)",
-            name="in_layers", datatype="GPLayer",
-            parameterType="Optional", direction="Input", multiValue=True,
+    def getParameterInfo(self, for_metadata=False):
+        p_mode = arcpy.Parameter(
+            displayName="Avgränsa området med", name="aoi_mode", datatype="GPString",
+            parameterType="Required", direction="Input",
         )
+        p_mode.filter.type = "ValueList"
+        p_mode.filter.list = [AOI_POLYGONS, AOI_EXTENT]
+        p_mode.value = AOI_POLYGONS
 
-        p_selection = arcpy.Parameter(
-            displayName="Använd endast markerade objekt (om markering finns)",
-            name="use_selection", datatype="GPBoolean",
+        # Båda är Optional i ramverket; updateMessages kräver den som valts.
+        # Feature Set: ett polygonlager (markering respekteras) eller ritade
+        # polygoner. Standardvärdet är ett tomt schema i SWEREF99 TM, så att
+        # ritverktyget ritar polygoner. Inget schema behövs för metadatafilen.
+        p_aoi = arcpy.Parameter(
+            displayName="Polygoner som definierar området", name="aoi",
+            datatype="GPFeatureRecordSetLayer",
             parameterType="Optional", direction="Input",
         )
-        p_selection.value = True
+        p_aoi.filter.list = ["Polygon"]
+        if not for_metadata:
+            try:
+                p_aoi.value = _polygon_schema()
+            except Exception:
+                pass
+
+        p_extent = arcpy.Parameter(
+            displayName="Utbredning", name="aoi_extent", datatype="GPExtent",
+            parameterType="Optional", direction="Input",
+        )
+        p_extent.enabled = False
 
         p_buffer = arcpy.Parameter(
             displayName="Marginal runt rektangeln (m)",
@@ -780,7 +958,7 @@ class ImportTopo10:
         )
         p_lyrx.filter.list = ["lyrx"]
 
-        return [p_layers, p_selection, p_buffer, p_source, p_themes, p_gdb,
+        return [p_mode, p_aoi, p_extent, p_buffer, p_source, p_themes, p_gdb,
                 p_prefix, p_overwrite, p_skip_empty, p_cache, p_keep,
                 p_add, p_symb, p_lyrx]
 
@@ -788,8 +966,17 @@ class ImportTopo10:
         return True
 
     def updateParameters(self, parameters):
-        p_source, p_themes = parameters[3], parameters[4]
-        p_cache, p_lyrx = parameters[9], parameters[13]
+        p = {q.name: q for q in parameters}
+
+        # Gammal etikett från skript: byt till den nya innan listfiltret kontrolleras.
+        if p["aoi_mode"].valueAsText == AOI_POLYGONS_OLD:
+            p["aoi_mode"].value = AOI_POLYGONS
+        by_extent = p["aoi_mode"].valueAsText == AOI_EXTENT
+        p["aoi"].enabled = not by_extent
+        p["aoi_extent"].enabled = by_extent
+
+        p_source, p_themes = p["source_folder"], p["themes"]
+        p_cache, p_lyrx = p["cache_folder"], p["lyrx_file"]
 
         if p_source.altered and not p_source.hasBeenValidated:
             folder = p_source.valueAsText
@@ -806,11 +993,31 @@ class ImportTopo10:
                 p_cache.value = _default_cache_dir()
 
         # Symbologi kräver att resultatet läggs till i kartan
-        parameters[12].enabled = bool(parameters[11].value)
-        parameters[13].enabled = bool(parameters[11].value and parameters[12].value)
+        p["apply_symbology"].enabled = bool(p["add_to_map"].value)
+        p["lyrx_file"].enabled = bool(p["add_to_map"].value and p["apply_symbology"].value)
 
     def updateMessages(self, parameters):
-        p_source, p_themes, p_gdb = parameters[3], parameters[4], parameters[5]
+        p = {q.name: q for q in parameters}
+        p_source, p_themes, p_gdb = p["source_folder"], p["themes"], p["out_gdb"]
+
+        mode = p["aoi_mode"].valueAsText
+        if mode == AOI_EXTENT:
+            if not p["aoi_extent"].valueAsText:
+                p["aoi_extent"].setErrorMessage("Ange en utbredning.")
+        elif mode in (AOI_POLYGONS, AOI_POLYGONS_OLD):
+            p_aoi = p["aoi"]
+            empty = not p_aoi.valueAsText
+            # Ritade polygoner: titta efter minst ett objekt (en rad, billigt).
+            # Ett kartlager räknas inte här, det kan vara stort eller en tjänst;
+            # ett tomt urval fångas vid körningen.
+            if not empty and not _is_map_layer(p_aoi.value):
+                try:
+                    empty = not _has_any_feature(p_aoi.value)
+                except Exception:
+                    empty = False
+            if empty:
+                p_aoi.setErrorMessage(
+                    "Rita minst en polygon i kartan eller välj ett polygonlager.")
 
         folder = p_source.valueAsText
         if folder and os.path.isdir(folder) and not _scan_source_cached(folder):
@@ -823,15 +1030,15 @@ class ImportTopo10:
         if gdb and not gdb.lower().rstrip("\\/").endswith((".gdb", ".sde")):
             p_gdb.setErrorMessage("Utdata måste vara en filgeodatabas (.gdb).")
 
-        if parameters[2].value is not None and parameters[2].value < 0:
-            parameters[2].setErrorMessage("Marginalen kan inte vara negativ.")
+        if p["buffer_m"].value is not None and p["buffer_m"].value < 0:
+            p["buffer_m"].setErrorMessage("Marginalen kan inte vara negativ.")
 
         if p_themes.values and not p_themes.filter.list:
             p_themes.setWarningMessage("Temalistan kunde inte läsas — kontrollera källmappen.")
 
-        cache = parameters[9].valueAsText
+        cache = p["cache_folder"].valueAsText
         if cache and any(hint in cache.lower() for hint in _SYNC_HINTS):
-            parameters[9].setWarningMessage(
+            p["cache_folder"].setWarningMessage(
                 "Mappen ser ut att synkas till molnet. Ett uppackat tema kan vara "
                 "flera GB — välj hellre en lokal mapp, t.ex. {}.".format(_default_cache_dir())
             )
@@ -839,38 +1046,42 @@ class ImportTopo10:
     # ── Körning ───────────────────────────────────────────────────────────────
 
     def execute(self, parameters, messages):
-        # Lagren matchas via namn mot kartans lager: kartlagren (arcpy.mp.Layer)
-        # vet om sin markering, vilket parameterns lagerobjekt inte gör.
-        layer_names   = [getattr(v, "name", str(v)) for v in (parameters[0].values or [])]
-        use_selection = bool(parameters[1].value)
-        buffer_m      = float(parameters[2].value or 0)
-        source_folder = parameters[3].valueAsText
-        themes        = [str(t) for t in parameters[4].values] if parameters[4].values else []
-        out_gdb       = parameters[5].valueAsText
-        prefix        = (parameters[6].valueAsText or "").strip()
-        overwrite     = bool(parameters[7].value)
-        skip_empty    = bool(parameters[8].value)
-        cache_folder  = parameters[9].valueAsText or _default_cache_dir()
-        keep_cache    = bool(parameters[10].value)
-        add_to_map    = bool(parameters[11].value)
-        apply_symb    = bool(parameters[12].value)
-        lyrx_path     = parameters[13].valueAsText
+        p = {q.name: q for q in parameters}
+        aoi_mode      = p["aoi_mode"].valueAsText
+        polygons      = p["aoi"].value if p["aoi"].valueAsText else None
+        extent_value  = p["aoi_extent"].value
+        extent_text   = p["aoi_extent"].valueAsText
+        buffer_m      = float(p["buffer_m"].value or 0)
+        source_folder = p["source_folder"].valueAsText
+        themes        = [str(t) for t in p["themes"].values] if p["themes"].values else []
+        out_gdb       = p["out_gdb"].valueAsText
+        prefix        = (p["prefix"].valueAsText or "").strip()
+        overwrite     = bool(p["overwrite"].value)
+        skip_empty    = bool(p["skip_empty"].value)
+        cache_folder  = p["cache_folder"].valueAsText or _default_cache_dir()
+        keep_cache    = bool(p["keep_extracted"].value)
+        add_to_map    = bool(p["add_to_map"].value)
+        apply_symb    = bool(p["apply_symbology"].value)
+        lyrx_path     = p["lyrx_file"].valueAsText
 
+        # Kartan behövs bara för att lägga till resultatet; utan karta
+        # importeras ändå.
         _aprx, map_obj = _current_map(messages)
-        if map_obj is None and not layer_names:
-            messages.addErrorMessage(
-                "Ingen aktiv karta hittades. Öppna en karta eller ange lager i verktyget."
-            )
-            raise arcpy.ExecuteError
 
         try:
             imported = _run_import(
-                map_obj, layer_names, use_selection, buffer_m, source_folder, themes,
-                out_gdb, prefix, overwrite, skip_empty, cache_folder, keep_cache,
-                add_to_map, apply_symb, lyrx_path, messages,
+                map_obj, aoi_mode, polygons, extent_value, extent_text, buffer_m,
+                source_folder, themes, out_gdb, prefix, overwrite, skip_empty,
+                cache_folder, keep_cache, add_to_map, apply_symb, lyrx_path, messages,
             )
         except ValueError as exc:
-            messages.addErrorMessage(str(exc))
+            error = str(exc)
+        else:
+            error = None
+        # Utanför except-blocket, så att Pro inte skriver ut hela kedjan av
+        # undantag under det läsbara felmeddelandet.
+        if error:
+            messages.addErrorMessage(error)
             raise arcpy.ExecuteError
 
         if imported:
@@ -884,17 +1095,22 @@ class ImportTopo10:
 # Körningens innehåll (separat funktion — går att testa utanför Pro)
 # =============================================================================
 
-def _run_import(map_obj, layer_names, use_selection, buffer_m, source_folder, themes,
-                out_gdb, prefix, overwrite, skip_empty, cache_folder, keep_cache,
-                add_to_map, apply_symb, lyrx_path, messages):
-    """Utför hela importen. Returnerar {källtabell: utdata-featureklass}."""
+def _run_import(map_obj, aoi_mode, polygons, extent_value, extent_text, buffer_m,
+                source_folder, themes, out_gdb, prefix, overwrite, skip_empty,
+                cache_folder, keep_cache, add_to_map, apply_symb, lyrx_path, messages):
+    """
+    Utför hela importen. Returnerar {källtabell: utdata-featureklass}.
+
+    aoi_mode är AOI_POLYGONS eller AOI_EXTENT. polygons är parametervärdet för
+    polygonerna (lager, ritade objekt eller sökväg), extent_value/extent_text
+    GPExtent-parameterns value och valueAsText.
+    """
 
     # 1. Område
     messages.addMessage("Beräknar omslutande rektangel...")
-    layers = _resolve_layers(map_obj, layer_names) if layer_names else _map_layers(map_obj)
-    if not layers:
-        raise ValueError("Kartan innehåller inga lager med geometri.")
-    ext = _bounding_box(layers, use_selection, buffer_m, messages)
+    arcpy.SetProgressorLabel("Beräknar omslutande rektangel...")
+    box = _aoi_box(aoi_mode, polygons, extent_value, extent_text, messages)
+    ext = _bounding_box(box, buffer_m, messages)
     clip_poly = _extent_polygon(ext)
 
     # 2. Källdata
