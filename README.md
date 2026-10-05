@@ -1,4 +1,4 @@
-# Import Topo 10 for current project
+# Importera Topo 10 för området
 
 ArcGIS Pro Python toolbox that imports **Lantmäteriet Topografi 10 (vektor)** into a file
 geodatabase, clipped to a rectangle around your project area.
@@ -24,7 +24,7 @@ This tool cuts that down to your project area in one step.
 ## Install
 
 1. Clone or download this repo.
-2. In ArcGIS Pro: Catalog, Toolboxes, Add Toolbox, select `ImportTopo10.pyt`.
+2. In ArcGIS Pro: Catalog, Toolboxes, Add Toolbox, select `ImporteraTopo10.pyt`.
 3. Open Lantmäteriet Topo 10, Importera Topo 10 till projektområdet.
 
 The tool has no dependencies beyond `arcpy` and the standard library.

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-ImportTopo10.pyt
+ImporteraTopo10.pyt
 
 Importerar Lantmäteriet Topografi 10 (vektor) från en nedladdad leverans till en
 filgeodatabas, klippt mot en rektangel (bounding box). Rektangeln är antingen
@@ -24,7 +24,7 @@ till i kartan och pekas om till de importerade featureklasserna. Teckensnittet
 lmtopografisymboler.ttf måste vara installerat i Windows för att symbolerna ska
 visas korrekt.
 
-Verktygstips (parameterförklaringar) skrivs till ImportTopo10.ImportTopo10.pyt.xml
+Verktygstips (parameterförklaringar) skrivs till ImporteraTopo10.ImporteraTopo10.pyt.xml
 från TOOLTIPS nedan när verktygslådan laddas, så att texten bara finns på ett ställe.
 
 Krav: ArcGIS Pro 3.x (arcpy). Ingen extra licensnivå — PairwiseClip ingår i Basic.
@@ -833,7 +833,7 @@ def _write_tool_metadata(tool_cls, toolbox_alias):
 
 class Toolbox:
     def __init__(self):
-        self.label = "Lantmäteriet Topo 10"
+        self.label = "Lantmäteriet: importera Topo 10 för området"
         self.alias = "topo10"
         self.tools = [ImportTopo10]
         _write_tool_metadata(ImportTopo10, self.alias)
