@@ -48,7 +48,7 @@ the last three groups are collapsible sections.
 | Skriv över befintliga featureklasser | on | Off = existing outputs are left untouched and reported as skipped |
 | Skapa inte featureklasser utan objekt i området | on | Off = every table gets a feature class, empty ones included |
 | **Källdata** | | |
-| Mapp för uppackade GeoPackage (cache) | `%TEMP%\LM_Topo10_uppackat` | Warns if you point it at a cloud-synced folder |
+| Mapp för uppackade GeoPackage (cache) | `%LOCALAPPDATA%\LM_Topo10_uppackat` | Where ZIPs are extracted; kept between runs and Pro sessions |
 | Behåll uppackade GeoPackage efter körningen | on | Off = files extracted during this run are deleted afterwards |
 | **Karta och symbologi** | | |
 | Lägg till resultatet i kartan | on | |
@@ -110,7 +110,9 @@ Measured on an 11 x 9 km area, including unzipping, on a laptop with the deliver
 ## Notes
 
 - Output is always SWEREF99 TM, regardless of the map's coordinate system.
-- The cache deliberately defaults to local `%TEMP%` rather than the download folder. Download
-  folders often sit in OneDrive, and a single extracted theme can be over 12 GB of sync traffic.
+- ArcGIS cannot read a GeoPackage inside a ZIP, so each theme is extracted once to the cache
+  folder and reused. It defaults to `%LOCALAPPDATA%`, not `%TEMP%`: inside Pro the temp folder is a
+  new `ArcGISProTemp<pid>` per session, so a cache there would be extracted again every session.
+  Delete the folder to free the space (a theme can be over 12 GB extracted).
 - Lantmäteriet's data, layer files and symbol font are not redistributed here. Download them from
   Geotorget and point the tool at that folder.

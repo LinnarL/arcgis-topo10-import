@@ -33,7 +33,6 @@ Krav: ArcGIS Pro 3.x (arcpy). Ingen extra licensnivå — PairwiseClip ingår i 
 import os
 import shutil
 import sqlite3
-import tempfile
 import uuid
 import zipfile
 from xml.sax.saxutils import escape
@@ -119,9 +118,10 @@ TOOLTIPS = {
         "snabbare. Avbockad: varje tabell i valda teman får en featureklass, även tomma."
     ),
     "cache_folder": (
-        "Mapp där ZIP-filerna packas upp till GeoPackage. Ett tema kan vara över 12 GB "
-        "uppackat, så välj en lokal disk med plats, inte en mapp som synkas till molnet "
-        "(OneDrive, SharePoint, Dropbox). Uppackade filer återanvänds vid nästa körning."
+        "Mapp där ZIP-filerna packas upp till GeoPackage, eftersom ArcGIS inte kan läsa en "
+        "GeoPackage direkt ur en ZIP. Standard är %LOCALAPPDATA%\\LM_Topo10_uppackat, som "
+        "ligger kvar mellan körningar och Pro-sessioner. Ett tema kan vara över 12 GB "
+        "uppackat, så välj en disk med plats. Uppackade filer återanvänds vid nästa körning."
     ),
     "keep_extracted": (
         "Behåll de GeoPackage som packades upp under körningen, så att nästa import går "
@@ -154,8 +154,6 @@ _SCAN_MAX_DEPTH = 3
 
 _CACHE_DIRNAME = "LM_Topo10_uppackat"
 
-# Mappar som synkas till molnet — olämpliga för flera GB uppackad data
-_SYNC_HINTS = ("onedrive", "sharepoint", "dropbox", "google drive")
 
 # Cache för mappgenomsökning (updateParameters anropas ofta)
 _scan_cache = {}
@@ -743,12 +741,19 @@ def _default_gdb():
 
 def _default_cache_dir():
     """
-    Standardmapp för uppackade GeoPackage: lokal temp-mapp.
+    Standardmapp för uppackade GeoPackage: %LOCALAPPDATA%/LM_Topo10_uppackat.
 
-    Medvetet inte i nedladdningsmappen — den ligger ofta i OneDrive, och ett
-    uppackat tema kan vara flera GB som då skulle synkas till molnet.
+    Inte tempfile.gettempdir(): inne i Pro är det en egen ArcGISProTemp<pid>-mapp
+    per session, så en cache där återanvänds aldrig i nästa session. Mappen skapas
+    här, annars ger DEFolder-parametern ERROR 000732 när dialogen öppnas.
     """
-    return os.path.join(tempfile.gettempdir(), _CACHE_DIRNAME)
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    path = os.path.join(base, _CACHE_DIRNAME)
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        pass
+    return path
 
 
 def _default_source_folder():
@@ -1036,12 +1041,6 @@ class ImportTopo10:
         if p_themes.values and not p_themes.filter.list:
             p_themes.setWarningMessage("Temalistan kunde inte läsas — kontrollera källmappen.")
 
-        cache = p["cache_folder"].valueAsText
-        if cache and any(hint in cache.lower() for hint in _SYNC_HINTS):
-            p["cache_folder"].setWarningMessage(
-                "Mappen ser ut att synkas till molnet. Ett uppackat tema kan vara "
-                "flera GB — välj hellre en lokal mapp, t.ex. {}.".format(_default_cache_dir())
-            )
 
     # ── Körning ───────────────────────────────────────────────────────────────
 
